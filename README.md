@@ -1,7 +1,7 @@
 # 两台电脑一根网线：台式机 + 笔记本跨机跑 14B 大模型
 
 **一句话总结**  
-一台 AMD RX6600 台式机与一台 NVIDIA RTX 4070 笔记本通过千兆网线直连，在 Windows 上成功运行 Qwen2.5-14B 的分布式推理（row 模式），实现 22K 上下文、12-19 tok/s。这是全网罕见的消费级跨机异构 GPU 分布式推理记录。
+一台 AMD RX6600 台式机与一台 NVIDIA RTX 4070 笔记本通过千兆网线直连，成功运行 Qwen2.5-14B 的跨机异构 GPU 分布式推理（row 模式），实现 20K 上下文、19-23 tok/s。测试覆盖 Windows Vulkan + Ubuntu ROCm 双后端。这是全网罕见的消费级跨机异构 GPU 分布式推理记录。
 
 ---
 
@@ -28,11 +28,11 @@
 | 模型 | 量化 | 文件大小 | 架构 | AMD Vulkan | ROCm |
 |---|---|---|---|---|---|
 | Qwen2.5-14B-Instruct | Q4_K_M | 8.99 GB | 标准 Transformer | ✅ | ⚠️ |
+| Qwen2.5-14B-Instruct | fp16 (原始) | 14.2 GB | 标准 Transformer | — | — |
 | Qwen3.5-4B | Q4_K_M | 2.61 GB | Gated Delta Net | ❌ | ❌ |
 | Qwen3.5-9B | IQ4_NL | 5.11 GB | Gated Delta Net | ❌ | ❌ |
 | Llama-3.2-3B-Instruct | Q4_K_M | 1.88 GB | 标准 Transformer | ✅ | — |
 | Mistral-7B-Instruct-v0.2 | Q4_K_M | 3.91 GB | 标准 Transformer | ✅ | — |
-| Qwen2.5-14B-Instruct | Q4_K_M (完整) | 14.2 GB | 标准 Transformer | ✅ | — |
 | Qwen2.5-32B-Instruct | Q4_K_M | 19.5 GB | 标准 Transformer | ⚠️ 待测 | — |
 
 ---
@@ -66,15 +66,16 @@ llama-server b9305 \
 -m qwen2.5-14b-instruct-q4_k_m.gguf \
 --rpc 192.168.1.49:50052 \
 --split-mode row --tensor-split 7,3 -ngl 999 \
---main-gpu 1 \
--c 20480 -b 64 -ub 64 \
+-c 16384 -b 64 -ub 64 \
 --cache-type-k q8_0 --cache-type-v f16
 ```
 
+> **注意：** `--main-gpu` 在 row 模式不生效（详见坑 3）。KV 跟随 layer 分配——tensor-split 决定各卡 KV 比例。20K 需 55:45 分压以降低笔电 KV。
+
 **分配方案：**  
 - 笔记本 RTX 4070：70% 推理层 → ~6.3 GB VRAM  
-- 台式机 RX6600：30% 推理层 → ~2.7 GB + 全量 KV Cache → ~2.5 GB（K q8_0）  
-- 台机总计约 5.2 GB VRAM，纯独显，零系统内存溢出。
+- 台式机 RX6600：30% 推理层 + 30% KV Cache  
+- 7:3 下笔电 KV ~1.8GB（16K q8_0），不超显存；20K 需切 55:45
 
 ---
 
@@ -143,7 +144,7 @@ KV 量化未造成可感知的质量下降。
 
 ---
 
-## 八个关键踩坑
+## 九个关键踩坑
 
 ### 坑 1：Gated Delta Net 架构不兼容 Vulkan / ROCm
 - Qwen3.5 全系使用 Gated Delta Net，在非 NVIDIA GPU 上预分配 buffer 直接撑爆 8GB 显存。
@@ -198,13 +199,16 @@ KV 量化未造成可感知的质量下降。
 
 ## 为什么分布式比单机慢？
 
-- RTX 4070 单机 4B：81 tok/s（12.3 ms/token）
-- 分布式 14B：17 tok/s（58.8 ms/token），慢了约 4.8 倍
+| 指标 | 单机 4070 (4B) | 分布式 14B | 比值 |
+|---|---|---|---|
+| 速度 | 81 tok/s | 17-23 tok/s | 慢 3.5-4.8x |
+| 每 token 时间 | 12.3 ms | 43-59 ms | — |
 
-**瓶颈不在 GPU 算力，而在网络。**  
-每个 token 生成时，隐状态（约 5KB 的 fp16 向量）必须跨一次网络边界。千兆 LAN 下一次 TCP 往返约 1ms。row 模式的同步屏障会将延迟放大：两张 GPU 计算各自矩阵切片后要互相等待，慢者决定全局速度。
-
-此外，Windows 上全走 CPU + TCP 协议栈，没有 Linux 上的 GPUDirect RDMA/NCCL 那样的 GPU→网卡直接 DMA 通道，**性能已达 llama.cpp RPC 在 Windows 上的物理极限。**
+**核心瓶颈：网络延迟**
+- 每 token 隐状态（~5KB fp16 向量）必须跨一次网络边界，千兆 LAN 一次 TCP 往返约 1ms
+- row 模式同步屏障放大延迟——双 GPU 算完各自矩阵切片后需互相等待，慢卡决定全局速度
+- Linux 有 GPUDirect RDMA/NCCL（GPU 显存直接 DMA 到网卡），但消费级硬件无此通道
+- **当前速度为 llama.cpp RPC 在千兆 LAN 上的物理极限**，跨平台结论一致
 
 ---
 
@@ -221,11 +225,11 @@ KV 量化未造成可感知的质量下降。
 
 ## 结论（核心发现）
 
-1. **两台独立 PC、千兆网线、异构 GPU 分布式推理在 Windows 上成功跑通**，消费级硬件实现 14B 模型 22K 上下文。
+1. **两台独立 PC、千兆网线、异构 GPU 分布式推理成功跑通**，消费级硬件实现 14B 模型 20K 上下文，覆盖 Windows Vulkan + Ubuntu ROCm 双后端。
 2. **非标准 Transformer 架构（Gated Delta Net / SSM）在非 NVIDIA GPU 上大概率无法运行。**
-3. **llama.cpp Windows 版 RPC buffer ~800MB 硬上限**，70/30 分压是当前版本天花板；22K 通过 K q8_0 + 系统内存辅助实现。
-4. **55/45 分压 + 内存溢出可行**——显存不够时系统内存可以平稳接管，速度损失可接受。
-5. **桌面 6600 双系统（Win + Ubuntu）提供 Vulkan/ROCm 双后端**，日常 Vulkan 够用，需要 GPU 加速训练时切 Ubuntu。
+3. **`--main-gpu` 在 row 模式不生效**——KV 跟随 layer 分配，tensor-split 决定各卡 KV 比例。7:3 下笔电扛 70% KV，16K 可跑但 20K 超显存；切 55:45 降低笔电 KV 解锁 20K。
+4. **ROCm 硬限 8GB 独显 vs Vulkan 共享 GPU 内存可溢 RAM**——同一配置在两个平台表现不同，根因是显存管理机制。
+5. **`-b 64 -ub 64` 不仅是吞吐参数**——压低批处理直接缩计算图缓冲，16K 上下文因此跑通。
 6. **WinRM 进程管理是最大的运维坑**——"先杀后启"是铁律，不杀就是叠模型叠到重启。
 7. **KV 先查 GQA 头数再算**——Qwen2.5-14B 实际 KV 只有之前估算的一半，算错直接误判上下文上限。
 
@@ -240,7 +244,7 @@ KV 量化未造成可感知的质量下降。
 | **结论** | 一句话能干什么，不能干什么 | "70/30 是 RPC buffer 天花板" |
 | **数据** | 实测数字，不靠推测 | "8 次采样平均 12.9 tok/s，标准差 3.4" |
 | **配置** | 可复制的完整命令行 | 最终黄金配置（见上文） |
-| **踩坑** | 每个坑的现象→原因→解法 | 八个坑全部附带错误信息和修复前/后对比 |
+| **踩坑** | 每个坑的现象→原因→解法 | 九个坑全部附带错误信息和修复前/后对比 |
 | **思考** | 为什么这样设计，物理极限在哪 | RPC 同步屏障分析、网络延迟拆解 |
 
 这五层从"能用"到"理解为什么能用"形成闭环。报峰值不如报稳态——缓存命中的 19.5 tok/s 是幸运抽奖，冷启动 15 tok/s 才是生产基准。
