@@ -11,7 +11,8 @@
 |---|---|---|
 | 角色 | 主控 + 本地推理 | 远程推理 |
 | GPU | AMD RX6600 8GB | NVIDIA RTX 4070 Laptop 8GB |
-| 后端 | Vulkan | CUDA |
+| 后端 | Vulkan (Windows) / ROCm (Ubuntu) | CUDA |
+| 后端差异 | Vulkan 共享 GPU 内存可溢 RAM | — |
 | 可用 VRAM | ~7.5 GB | ~7.6 GB |
 | 系统 RAM | 16 GB DDR4 | 12 GB DDR5 |
 | OS | Windows 10 + Ubuntu 24.04 双系统 | Windows 11 |
@@ -43,11 +44,18 @@
 | 模型 | Prompt tok/s | Generation tok/s | 显存占用 |
 |---|---|---|---|
 | Qwen3.5-4B Q4_K_M | 213 | 81.0 | 5.9 GB |
+| Qwen3.5-4B IQ4_NL | 136.5 | 75.1 | — |
 | Qwen3.5-9B IQ4_NL | 156 | 46.4 | 5.8 GB |
 | Llama-3.2-3B Q4_K_M | 29 | 111.6 | 6.0 GB |
 
-**RX6600 单卡 Llama-3.2-3B：** Prompt 38 tok/s，Generation 77.3 tok/s。  
-Vulkan 在标准 Transformer 上表现正常，小批次 prompt 处理甚至反超 4070。
+**RX6600 单卡：**
+
+| 模型 | Prompt tok/s | Generation tok/s |
+|---|---|---|
+| Qwen3.5-4B IQ4_NL | 116.0 | 51.8 |
+| Llama-3.2-3B Q4_K_M | 38 | 77.3 |
+
+Vulkan 在标准 Transformer 上表现正常，4B 小批次 prompt 处理反超 4070。Qwen3.5-4B IQ4_NL 上 4070 领先 45%（gen）和 18%（prompt）。
 
 ---
 
@@ -70,20 +78,27 @@ llama-server b9305 \
 
 ---
 
-### 速度数据（Qwen2.5-14B，row 模式，70/30）
+### 速度数据（Qwen2.5-14B，row 模式）
 
-| 上下文长度 | KV 配置 | Prompt tok/s | Generation tok/s | 桌面 KV 显存 |
+**Windows Vulkan + CUDA（历史基准，b9305 预编版）：**
+
+| 上下文长度 | KV 配置 | Prompt tok/s | Generation tok/s |
+|---|---|---|---|
+| 4,096 | fp16 | 86.3 | 19.4 |
+| 8,192 | fp16 | 87.1 | 17.8 |
+| 16,384 | fp16 | 90.0 | 19.5 |
+| **20,480** | **K q8_0** | **30.0** | **17.0** |
+
+**Ubuntu ROCm + CUDA（2026-06-29 重新编译版）：**
+
+| 上下文 | 分压 | Prompt tok/s | Generation tok/s | 备注 |
 |---|---|---|---|---|
-| 256 | fp16 | 56.0 | 8.8 | ~0.1 GB |
-| 1,024 | fp16 | 53.3 | 15.0 | ~0.4 GB |
-| 2,048 | fp16 | 77.7 | 15.0 | ~0.8 GB |
-| 4,096 | fp16 | 86.3 | 19.4 | ~1.5 GB |
-| 8,192 | fp16 | 87.1 | 17.8 | ~3.0 GB |
-| 12,288 | fp16 | 54.0 | 18.4 | ~4.5 GB |
-| 16,384 | fp16 | 90.0 | 19.5 | ~6.0 GB |
-| **20,480** | **K q8_0** | **30.0** | **17.0** | **~2.5 GB** |
+| 4,096 | 7:3 | 20.4 | 23.3 | ROCm + CUDA RPC |
+| 12,288 | 7:3 | 22.0 | 23.0 | mmap ✓ |
+| 16,384 | 7:3 + `-b 64` | 18.9 | 21.9 | `-b 64 -ub 64` 缩小 RPC buffer |
+| **20,480** | **55:45 + `-b 64`** | **18-48** | **19-21** | 55%层给笔电，KV 不超显存 |
 
-> 20K fp16 KV 分配失败（RPC buffer 超限），改用 K q8_0 量化后成功，KV 显存减半。
+> 重新编译版 prompt 速度显著低于预编版（86→20），推测与 ROCm 编译优化或 `ggml-rpc-server` 替代 `llama-server` 做 worker 有关。生成速度反而略优（19.4→23.3）。
 
 **8 次连续采样（20K K q8_0，短 prompt）：**  
 `10, 15, 16, 14, 14, 11, 6, 16` — 平均 12.9 tok/s，标准差 3.4。  
@@ -91,24 +106,18 @@ llama-server b9305 \
 
 ---
 
-### 进一步压测：55/45 分压 → 22K 上下文
+### 55:45 分压 → 20K 上下文
 
-将分压比调为 **55/45**（笔电 55%，桌面 45%），成功将上下文推至 **22K**：
+7:3 分压下 20K 失败——KV 按层分配，笔电扛 70% KV（~2.25GB）超出 4070 剩余显存。切到 **55:45** 后笔电 KV 降至 ~1.7GB，成功跑通。
 
-| 上下文 | KV 配置 | Generation tok/s | 桌面显存 |
+**关键发现：`--main-gpu` 在 row 模式不生效。** 源码 `llama-kv-cache.cpp:229` 确认——KV 跟随 layer 分配，层在哪 GPU，KV 就在哪。`--main-gpu` 仅在 none/layer 模式有效。
+
+| 上下文 | 分压 | Generation tok/s | 笔电 KV |
 |---|---|---|---|
-| 22,016 | K q8_0 | 11-15 | 桌面 VRAM ~4.2 GB + 系统 RAM ~3 GB |
+| 16,384 | 55:45 | 19-21 | ~1.4 GB |
+| 20,480 | 55:45 + `-b 64` | 19-21 | ~1.7 GB |
 
-**关键发现：** 45% 层分配加上 22K KV 超出独显容量时，系统内存自动接管溢出部分（~3GB）。通过设置 `--main-gpu 1` 确保 KV 核心保留在 6600 上，溢出层走 DDR4，速度损失可接受（从 17 tok/s 降至 12-15 tok/s）。**这验证了"显存+内存联合推理"的可行性——溢出 10GB 到系统内存也不会崩溃。**
-
-### 6/4 分压测试（笔电 60%，桌面 40%）
-
-| 上下文 | Generation tok/s | 备注 |
-|---|---|---|
-| 16,384 | 16-18 | 稳定，桌面 40% 层+KV 在 7.5GB 内 |
-| 20,480 | 12-16 | K q8_0，桌面接近显存上限 |
-
-6/4 比 7/3 更均衡——桌面内存压力更小，笔电仍有余量。适合长时间运行的稳定性优先场景。
+**ROCm vs Vulkan 显存差异：** Windows Vulkan 有共享 GPU 内存——显存爆了自动溢到系统 RAM。Ubuntu ROCm 硬限 8GB 独显，超了直接分配失败。这就是上回 Windows 20K 7:3 成功、这回 ROCm 失败的根本原因。
 
 ---
 
@@ -146,19 +155,15 @@ KV 量化未造成可感知的质量下降。
 - **原因：** localhost RPC 多了一次序列化/反序列化，GPU 内存被当作 host memory 分配。
 - **解决：** 去掉 `127.0.0.1:50053`，coordinator 直接使用本地 Vulkan GPU。修复后显存占用升至 5-6GB，速度从 1.7 tok/s 跳到 11.4 tok/s。
 
-### 坑 3：layer 模式 KV 被均分
-- `--split-mode layer` 会按 tensor-split 比例切分 KV cache 到所有 GPU，导致笔记本拿到大部分 KV，桌面只用 30%，大量 KV 溢出到内存。
-- `--main-gpu` 参数仅在 row 模式有效。
-- **解决：** 改用 `--split-mode row --main-gpu 1`，全量 KV 锁在桌面 RX6600 上。
+### 坑 3：layer 模式 KV 被均分 / row 模式 main-gpu 不生效
+- `--split-mode layer` 会按 tensor-split 比例切分 KV cache 到所有 GPU。
+- **旧假设（错误）：** `--main-gpu 1` 在 row 模式可锁定 KV 到指定 GPU。
+- **实测验证（2026-06-29）：** `--main-gpu` 在 row 模式根本不生效。源码 `llama-kv-cache.cpp:229` 确认——KV 跟随 layer 分配，层在哪 GPU，KV 就在哪。7:3 分压 = 笔电 70% KV。
+- **解决：** 7:3 下笔电 KV ~2.25GB（20K q8_0）超显存 → 切 55:45 降笔电 KV 至 ~1.7GB 装得下。真正的 KV 控制靠 tensor-split 而非 main-gpu。
 
-### 坑 4：RPC Buffer 硬上限
-- 尝试将笔记本分压比例提升至 75%/80% 时，出现 buffer 分配失败：
-  ```
-  alloc_tensor_range: failed to allocate RPC0[192.168.1.49:50052]
-  buffer of size 1073741824
-  ```
-- llama.cpp Windows 版 RPC server 约 800MB buffer 上限，超出直接拒绝。
-- **70% 是当前版本的硬天花板。** 20K fp16 KV 也因同一限制失败，通过 K q8_0 降量解决。
+### 坑 4：RPC Buffer 与 `-b -ub` 批处理
+- 默认批处理（2048+）会在 16K 上下文时产生 ~1.44GB 计算图缓冲，超出 RPC buffer 上限。
+- **解决：** `-b 64 -ub 64` 将批处理批次从 2048 压到 64，计算图缓冲缩至几十分之一，16K 立即跑通。这是实测发现的——`-b` 不仅影响吞吐，还直接决定 RPC buffer 能否装下计算图。
 
 ### 坑 5：KV Cache 公式修正
 - 原始计算用全部 attention 头（40），实际 Qwen2.5-14B 使用 GQA，40 个 query 头共享 8 个 KV 头。
@@ -183,6 +188,11 @@ KV 量化未造成可感知的质量下降。
 - 多次启动 rpc-server 时未先杀旧进程，WinRM 每次新发命令叠一个新实例。
 - 两个 llama.cpp 实例各自分配显存 + 内存，16GB 内存耗尽后 Windows 强制重启桌面。
 - **教训：** 远程命令第一行永远是 `Get-Process | Stop-Process -Force` 杀旧进程。WinRM 环境下进程不会自动回收——每发一次新命令没清旧的就是叠模型叠到死。
+
+### 坑 9：ROCm vs Vulkan 的显存溢出机制不同
+- **Windows Vulkan：** 有共享 GPU 内存——独显爆了自动溢到系统 RAM。这也是上回 20K 7:3 成功的原因。
+- **Ubuntu ROCm：** 硬限 8GB 独显，超出直接分配失败。同样 7:3 配置，20K 在 ROCm 下笔电 KV 2.25GB 超显存。
+- **GPU 编号也反了：** Windows 下 GPU0=RPC笔电 GPU1=Vulkan桌面；Ubuntu 下 GPU0=ROCm桌面 GPU1=RPC笔电。`--main-gpu` 值在两平台含义不同。
 
 ---
 
