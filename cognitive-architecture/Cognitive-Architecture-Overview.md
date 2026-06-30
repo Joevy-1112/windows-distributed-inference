@@ -3,7 +3,7 @@
 > **Retrieval is reasoning.** Every step along a causal path in the knowledge graph is itself an inference step.
 > Path selection = reasoning process. Path endpoint = answer basis.
 >
-> Author: Joe & Hermes · June 2026
+> Author: Joe · June 2026
 > Status: Theory complete, implementation in progress
 
 ---
@@ -329,13 +329,8 @@ I'm publishing this not because it's finished, but because I think the ideas are
 ## License & Attribution
 
 This document describes ongoing research and development. Implementations live across:
-- `memory-db` — SQLite-based hierarchical memory system (Hermes Agent skill)
+- `memory-db` — SQLite-based hierarchical memory system
 - `cognitive-architecture` — Design documents and reference implementations
 - `embed` — Edge-side affective computing and atmosphere vector research (forthcoming)
 
-The three-axis + causal chain cognitive model was developed through iterative design sessions between the author and an AI agent (Hermes) during June 2026. The agent articulated the framework; the author guided the design and identified gaps.
-
----
-
-*"先整当下的记忆系统吧 在记忆系统这塞个简化版的 认知系统之后就能靠这个简化版未来无缝衔接上"*
-*— June 30, 2026*
+The three-axis + causal chain cognitive model was developed through iterative design sessions between the author and an AI agent during June 2026.
